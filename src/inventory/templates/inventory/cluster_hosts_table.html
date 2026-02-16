@@ -1,0 +1,94 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Cluster Hosts Inventory</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; }
+    h1 { margin-bottom: 8px; }
+    form { margin: 12px 0 18px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    select, input { padding: 6px 8px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; font-size: 13px; }
+    th { background: #f5f5f5; text-align: left; position: sticky; top: 0; }
+    tr:nth-child(even) { background: #fafafa; }
+    .muted { color: #666; font-size: 12px; }
+    .badge { padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+    .ok { background: #e7f6ea; }
+    .bad { background: #fdeaea; }
+  </style>
+</head>
+<body>
+  <h1>Inventory: Clusters → Hosts</h1>
+  <div class="muted">One row per host. Filter by cluster or search text.</div>
+
+  <form method="get">
+    <label>Cluster:</label>
+    <select name="cluster">
+      <option value="">All</option>
+      {% for c in clusters %}
+        <option value="{{ c }}" {% if c == selected_cluster %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+
+    <label>Search:</label>
+    <input name="q" value="{{ q }}" placeholder="hostname, model, bios, idrac...">
+
+    <button type="submit">Apply</button>
+    <a href="/inventory/cluster-hosts/">Reset</a>
+  </form>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Cluster</th>
+        <th>Hostname</th>
+        <th>Type</th>
+        <th>Serial Number</th>
+        <th>Asset Tag</th>
+        <th>Model</th>
+        <th>BIOS Version</th>
+        <th>Location</th>
+        <th>Rack</th>
+        <th>Quad</th>
+        <th>Shelf</th>
+        <th>Status</th>
+        <th>iDRAC</th>
+        <th>Updated</th>
+        <th>Enabled</th>
+        <th>Last Seen</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for h in hosts %}
+      <tr>
+        <td>{{ h.cluster.name }}</td>
+        <td>{{ h.hostname }}</td>
+        <td>{{ h.host_type }}</td>
+        <td>{{ h.serialnumber|default:"-" }}</td>   
+        <td>{{ h.asset_tag|default:"-" }}</td> 
+        <td>{{ h.hw_model|default:"-" }}</td>
+        <td>{{ h.bios_version|default:"-" }}</td>  
+        <td>{{ h.location|default:"-" }}</td>
+        <td>{{ h.rack|default:"-" }}</td>
+        <td>{{ h.quad|default:"-" }}</td>    
+        <td>{{ h.shelf|default:"-" }}</td>
+        <td>
+          {% if h.status == "available" %}
+            <span class="badge ok">{{ h.status }}</span>
+          {% else %}
+            <span class="badge bad">{{ h.status }}</span>
+          {% endif %}
+        </td>
+        <td>{{ h.idrac_host|default:"-" }}</td>
+        <td>{{ h.updated_at|default:"-" }}</td>
+        <td>{{ h.enabled }}</td>
+        <td>{{ h.last_seen|default:"-" }}</td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="10">No hosts found.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>
