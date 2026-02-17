@@ -7,9 +7,10 @@ from inventory.models import Host
 
 @register_table
 class HostTableView(HPCTables):
-    table_id = "inventory"
     table_group = "hosts"
-    table_label = "Inventory Map"
+    table_id = "inventory"
+    table_label = "Compute Inventory"
+    # http://127.0.0.1:8001/tables/hosts/inventory/
 
     model = Host
     queryset = (
