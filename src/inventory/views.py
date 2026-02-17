@@ -28,7 +28,7 @@ def cluster_hosts_table(request):
             Q(hostname__icontains=q) |
             Q(cluster__name__icontains=q) |
             Q(host_type__icontains=q) |
-            Q(status__iexact=q) |           # exact for choices
+            Q(status__iexact=q) |       
             Q(idrac_host__icontains=q) |
             Q(hw_model__icontains=q) |
             Q(bios_version__icontains=q) |

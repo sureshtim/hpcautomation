@@ -1,0 +1,62 @@
+{% load static %}
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>{{ table.table_label }}</title>
+
+  <link rel="stylesheet" href="{% static 'vendor/tabulator/tabulator.min.css' %}">
+  <style>
+    body{ font-family: system-ui, Arial; background:#f6f8fb; margin:0; }
+    .page{ padding: 16px 18px; }
+    .topbar{
+      display:flex; align-items:center; gap:12px;
+      background:#fff; border:1px solid #d9e2ef;
+      padding:12px 14px; border-radius:12px;
+    }
+    .toolbar{ margin-left:auto; display:flex; gap:10px; align-items:center; }
+    .btn{ border:1px solid #d9e2ef; background:#fff; padding:8px 12px; border-radius:10px; cursor:pointer; }
+    .btn:hover{ background:#f1f5f9; }
+    .input{ border:1px solid #d9e2ef; padding:9px 12px; border-radius:10px; width:320px; }
+    .table-wrap{ margin-top:12px; background:#fff; border:1px solid #d9e2ef; border-radius:12px; overflow:hidden; }
+    #table{ height: calc(100vh - 120px); }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="topbar">
+      <div style="font-weight:700;font-size:18px;">{{ table.table_label }}</div>
+      <div class="toolbar">
+        <button class="btn" id="btn-refresh">Refresh</button>
+        <button class="btn" id="btn-export">Export CSV</button>
+        <button class="btn" id="btn-clear-filters">Clear Filters</button>
+        <input class="input" id="table-search" placeholder="Search..." />
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <div id="table"></div>
+    </div>
+  </div>
+
+  <!-- ✅ Must load Tabulator first -->
+  <script src="{% static 'vendor/tabulator/tabulator.min.js' %}"></script>
+
+  <!-- ✅ Then your wrapper -->
+  <script src="{% static 'js/tabulator_table.js' %}"></script>
+
+  <script>
+    console.log("Tabulator exists?", typeof Tabulator);
+    console.log("createHPCTable exists?", typeof createHPCTable);
+
+    createHPCTable({
+      elId: "table",
+      apiUrl: "/api/tables/{{ table.table_group }}/{{ table.table_id }}/",
+      searchId: "table-search",
+      exportBtnId: "btn-export",
+      refreshBtnId: "btn-refresh",
+      clearFiltersBtnId: "btn-clear-filters"
+    });
+  </script>
+</body>
+</html>
