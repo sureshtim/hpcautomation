@@ -17,6 +17,9 @@ class HostTableView(HPCTables):
         Host.objects.select_related("cluster").all().order_by("cluster__name", "hostname")
     )
 
+    view_permission = "inventory.view_hosts_inventory"
+    edit_permission = None
+
     tabulator_settings = {
         "progressiveLoad": "scroll",
         "paginationMode": "remote",
@@ -36,8 +39,10 @@ class HostTableView(HPCTables):
 
     def __init__(self):
         self.layout = ColumnLayout(
-            Column(title="Cluster", field="cluster__name", frozen=True),
+            Column(title="Cluster", field="cluster__name", frozen=True, editable=False),
             Column(title="Host Name", field="hostname", frozen=True),
+            Column(title="OS", field="os_type"),
+            Column(title="Kernal", field="kernal_version"),
             Column(title="Host Type", field="host_type"),
             Column(title="Status", field="status"),
             Column(title="Serial Number", field="serialnumber"),
@@ -48,5 +53,6 @@ class HostTableView(HPCTables):
             Column(title="Rack", field="rack"),
             Column(title="Quad", field="quad"),
             Column(title="Shelf", field="shelf"),
+            Column(title="Used For", field="used_for"),
         )
         super().__init__(self.layout)

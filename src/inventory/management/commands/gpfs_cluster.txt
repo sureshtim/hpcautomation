@@ -1,0 +1,9 @@
+gmhpc3
+gmhpc4
+gmhpc7
+gmhpc8
+hpc-appl
+gmscr01
+gmscr02
+gmscr03
+gmscr04

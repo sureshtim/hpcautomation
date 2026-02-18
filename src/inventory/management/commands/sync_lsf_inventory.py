@@ -6,6 +6,8 @@ from typing import List, Tuple, Optional, Dict
 
 import paramiko
 import requests
+from urllib3.exceptions import InsecureRequestWarning
+
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
@@ -35,7 +37,6 @@ def ssh_run(host: str, username: str, password: str, cmd: str, timeout: int = 60
 
         stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
 
-        # CRITICAL FIX: Set explicit timeout on channels to prevent PipeTimeout / socket.timeout
         stdout.channel.settimeout(timeout)
         stderr.channel.settimeout(timeout)
 
@@ -48,8 +49,10 @@ def ssh_run(host: str, username: str, password: str, cmd: str, timeout: int = 60
         return out
 
     except Exception as e:
-        client.close()
-        # Return error string so caller can detect failure
+        try:
+            client.close()
+        except Exception:
+            pass
         return f"SSH_ERROR: {type(e).__name__}: {str(e)}"
 
 
@@ -165,13 +168,22 @@ def sh_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
+def get_nested(d: dict, path: List[str]) -> Optional[object]:
+    cur: object = d
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
 # -----------------------------
 # Redfish helpers (Dell + Supermicro compatible)
 # -----------------------------
 def discover_system_id_direct(sess, base: str, timeout: int, stdout, style) -> str:
     """Auto-detect System ID (Dell: System.Embedded.1, Supermicro: 1, etc.)"""
     try:
-        r = sess.get(f"{base}/redfish/v1/Systems", timeout=timeout)
+        r = sess.get(f"{base}/redfish/v1/Systems", timeout=timeout, headers={"Accept": "application/json"})
         if r.status_code == 200:
             data = r.json()
             members = data.get("Members", [])
@@ -181,10 +193,38 @@ def discover_system_id_direct(sess, base: str, timeout: int, stdout, style) -> s
                 if sid:
                     stdout.write(style.SUCCESS(f"  → Discovered System ID: {sid}"))
                     return sid
-    except Exception as e:
+    except Exception:
         pass
     stdout.write(style.WARNING("  → Discovery failed, falling back to common IDs"))
-    return "System.Embedded.1"  # safe default
+    return "System.Embedded.1"
+
+
+def extract_serial_and_asset(system_json: dict) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Policy:
+      - Dell asset_tag = Oem.Dell.DellSystem.NodeID
+      - Supermicro asset_tag = SerialNumber (AssetTag is often null)
+      - Fallback asset_tag = AssetTag if present else SerialNumber
+    """
+    oem = system_json.get("Oem") or {}
+
+    serial = system_json.get("SerialNumber") or system_json.get("UUID")
+
+    dell = oem.get("Dell") or {}
+    serial = serial or dell.get("ServiceTag")
+
+    sm = oem.get("Supermicro") or oem.get("SuperMicro") or {}
+    serial = serial or sm.get("SystemSerialNumber") or sm.get("SerialNumber")
+
+    node_id = get_nested(system_json, ["Oem", "Dell", "DellSystem", "NodeID"])
+    if isinstance(node_id, str) and node_id.strip():
+        return serial, node_id.strip()
+
+    asset = system_json.get("AssetTag") or system_json.get("AssetTagNumber")
+    if isinstance(asset, str) and asset.strip():
+        return serial, asset.strip()
+
+    return serial, serial
 
 
 def redfish_get_system_info_direct(
@@ -203,7 +243,6 @@ def redfish_get_system_info_direct(
     sess.verify = False
     sess.headers.update({"Accept": "application/json"})
 
-    # Auto-discover System ID (supports Dell, Supermicro, HPE, etc.)
     system_id = discover_system_id_direct(sess, base, timeout, stdout, style)
 
     candidates = [
@@ -212,14 +251,13 @@ def redfish_get_system_info_direct(
         "/redfish/v1/Systems/System.1",
         "/redfish/v1/Systems/1",
     ]
-    # Deduplicate while preserving order
     candidates = list(dict.fromkeys(candidates))
 
     system_json = None
     last_err = None
     for path in candidates:
         try:
-            r = sess.get(base + path, timeout=timeout)
+            r = sess.get(base + path, timeout=timeout, headers={"Accept": "application/json"})
             if r.status_code == 200:
                 system_json = r.json()
                 stdout.write(style.SUCCESS(f"  → Used endpoint: {path}"))
@@ -230,7 +268,7 @@ def redfish_get_system_info_direct(
 
     if not system_json:
         stdout.write(style.WARNING(f"FAILED iDRAC direct {idrac_host} → {last_err}"))
-        return {"name": None, "model": None, "bios": None, "error": last_err}
+        return {"name": None, "model": None, "bios": None, "serial": None, "asset_tag": None, "error": last_err}
 
     model = system_json.get("Model")
     name = system_json.get("HostName") or system_json.get("DNSHostName") or system_json.get("Name")
@@ -240,19 +278,22 @@ def redfish_get_system_info_direct(
         bios_link = system_json.get("Bios", {}).get("@odata.id")
         if bios_link:
             try:
-                rb = sess.get(base + bios_link, timeout=timeout)
+                rb = sess.get(base + bios_link, timeout=timeout, headers={"Accept": "application/json"})
                 if rb.status_code == 200:
                     bj = rb.json()
                     bios = bj.get("Version") or bj.get("Name")
             except Exception:
                 pass
 
+    serial, asset_tag = extract_serial_and_asset(system_json)
+
     stdout.write(
         style.SUCCESS(
-            f"Success iDRAC direct {idrac_host} → model={model or '—'}, bios={bios or '—'}"
+            f"Success iDRAC direct {idrac_host} → model={model or '—'}, bios={bios or '—'}, "
+            f"serial={serial or '—'}, asset={asset_tag or '—'}"
         )
     )
-    return {"name": name, "model": model, "bios": bios, "error": None}
+    return {"name": name, "model": model, "bios": bios, "serial": serial, "asset_tag": asset_tag, "error": None}
 
 
 def redfish_get_system_info_via_ssh(
@@ -268,12 +309,12 @@ def redfish_get_system_info_via_ssh(
 ) -> Dict[str, Optional[str]]:
     stdout.write(f"Attempting iDRAC via SSH ({ssh_host}) → {idrac_host}")
 
-    # Auto-discover System ID using Python one-liner (reliable on HPC masters)
     disc_cmd = (
         "bash -lc "
         + repr(
             f"curl -k -sS --fail --max-time {timeout} "
             f"-u {sh_quote(idrac_user)}:{sh_quote(idrac_password)} "
+            f"-H 'Accept: application/json' "
             f"https://{idrac_host}/redfish/v1/Systems "
             f"| python3 -c "
             f"'import sys,json; d=json.load(sys.stdin); "
@@ -286,15 +327,15 @@ def redfish_get_system_info_via_ssh(
     system_id = disc_out.strip() or "1"
     if "SSH_ERROR" in disc_out:
         stdout.write(style.WARNING(f"  → SSH discovery failed: {disc_out}"))
-        return {"name": None, "model": None, "bios": None, "error": disc_out}
+        return {"name": None, "model": None, "bios": None, "serial": None, "asset_tag": None, "error": disc_out}
     stdout.write(style.SUCCESS(f"  → Discovered System ID: {system_id}"))
 
-    # Fetch main system info
     cmd = (
         "bash -lc "
         + repr(
             f"curl -k -sS --fail --max-time {timeout} "
             f"-u {sh_quote(idrac_user)}:{sh_quote(idrac_password)} "
+            f"-H 'Accept: application/json' "
             f"https://{idrac_host}/redfish/v1/Systems/{system_id}"
         )
     )
@@ -302,67 +343,67 @@ def redfish_get_system_info_via_ssh(
 
     if "SSH_ERROR" in out:
         stdout.write(style.WARNING(f"FAILED iDRAC via SSH {idrac_host} → {out}"))
-        return {"name": None, "model": None, "bios": None, "error": out}
+        return {"name": None, "model": None, "bios": None, "serial": None, "asset_tag": None, "error": out}
 
     try:
         j = json.loads(out)
         model = j.get("Model")
         bios = j.get("BiosVersion")
+        name = j.get("HostName") or j.get("DNSHostName") or j.get("Name")
+        serial, asset_tag = extract_serial_and_asset(j)
+
         stdout.write(
             style.SUCCESS(
-                f"Success iDRAC via SSH {idrac_host} → model={model or '—'}, bios={bios or '—'}"
+                f"Success iDRAC via SSH {idrac_host} → model={model or '—'}, bios={bios or '—'}, "
+                f"serial={serial or '—'}, asset={asset_tag or '—'}"
             )
         )
-        return {
-            "name": j.get("HostName") or j.get("DNSHostName") or j.get("Name"),
-            "model": model,
-            "bios": bios,
-            "error": None,
-        }
+        return {"name": name, "model": model, "bios": bios, "serial": serial, "asset_tag": asset_tag, "error": None}
     except Exception:
-        # Fallback to common Dell/Supermicro IDs
-        fallbacks = ["System.Embedded.1", "System.1", "1"]
-        for fb_id in fallbacks:
-            if fb_id == system_id:
-                continue
-            cmd2 = (
-                "bash -lc "
-                + repr(
-                    f"curl -k -sS --fail --max-time {timeout} "
-                    f"-u {sh_quote(idrac_user)}:{sh_quote(idrac_password)} "
-                    f"https://{idrac_host}/redfish/v1/Systems/{fb_id}"
-                )
-            )
-            out2 = ssh_run(ssh_host, ssh_user, ssh_password, cmd2, timeout=timeout)
-            if "SSH_ERROR" in out2:
-                continue
-            try:
-                j2 = json.loads(out2)
-                model = j2.get("Model")
-                bios = j2.get("BiosVersion")
-                stdout.write(
-                    style.SUCCESS(
-                        f"Success iDRAC via SSH (fallback {fb_id}) {idrac_host} → model={model or '—'}, bios={bios or '—'}"
-                    )
-                )
-                return {
-                    "name": j2.get("HostName") or j2.get("DNSHostName") or j2.get("Name"),
-                    "model": model,
-                    "bios": bios,
-                    "error": None,
-                }
-            except:
-                continue
-
-        # Final failure
         snippet = (out or "")[:200].replace("\n", " ")
-        err_msg = f"JSON parse failed after discovery. Snippet: {snippet}"
+        err_msg = f"JSON parse failed. Snippet: {snippet}"
         stdout.write(style.WARNING(f"FAILED iDRAC via SSH {idrac_host} → {err_msg}"))
-        return {"name": None, "model": None, "bios": None, "error": err_msg}
+        return {"name": None, "model": None, "bios": None, "serial": None, "asset_tag": None, "error": err_msg}
+
+
+# -----------------------------
+# OS discovery over SSH to host
+# -----------------------------
+def parse_pretty_name(text: str) -> Optional[str]:
+    # expected: PRETTY_NAME="Rocky Linux 8.9 (Green Obsidian)"
+    m = re.search(r'^PRETTY_NAME\s*=\s*"(.*)"\s*$', (text or "").strip(), flags=re.M)
+    if m:
+        return m.group(1).strip() or None
+    m2 = re.search(r"^PRETTY_NAME\s*=\s*(.*)\s*$", (text or "").strip(), flags=re.M)
+    if m2:
+        val = m2.group(1).strip().strip('"')
+        return val or None
+    return None
+
+
+def parse_single_line(text: str) -> Optional[str]:
+    s = (text or "").strip()
+    if not s or s.startswith("SSH_ERROR"):
+        return None
+    return s.splitlines()[0].strip() or None
+
+
+def parse_used_for(text: str) -> Optional[str]:
+    # /etc/GMIT-HPC may have multiple lines; store first non-empty line
+    if not text or text.startswith("SSH_ERROR"):
+        return None
+    for line in text.splitlines():
+        v = line.strip()
+        if v:
+            return v
+    return None
 
 
 class Command(BaseCommand):
-    help = "Sync HPC clusters+hosts from LSF; optionally enrich with iDRAC/Redfish model/BIOS (Dell + Supermicro)."
+    help = (
+        "Sync HPC clusters+hosts from LSF; optionally enrich with iDRAC/Redfish model/BIOS + serialnumber/asset_tag "
+        "(Dell NodeID, Supermicro SerialNumber). Also collects used_for/os_type/kernal_version via SSH to hosts."
+    )
 
     def add_arguments(self, parser):
         parser.add_argument("--jump", required=True)
@@ -373,14 +414,8 @@ class Command(BaseCommand):
         parser.add_argument("--disable-missing", action="store_true")
         parser.add_argument("--use-login-shell", action="store_true", default=True)
 
-        parser.add_argument(
-            "--master-domain",
-            default=os.getenv("LSF_MASTER_DOMAIN", ".nam.gm.com"),
-        )
-        parser.add_argument(
-            "--host-domain",
-            default=os.getenv("LSF_HOST_DOMAIN", ".edc.nam.gm.com"),
-        )
+        parser.add_argument("--master-domain", default=os.getenv("LSF_MASTER_DOMAIN", ".nam.gm.com"))
+        parser.add_argument("--host-domain", default=os.getenv("LSF_HOST_DOMAIN", ".edc.nam.gm.com"))
 
         # iDRAC / Redfish
         parser.add_argument("--idrac", action="store_true")
@@ -389,14 +424,17 @@ class Command(BaseCommand):
         parser.add_argument("--idrac-timeout", type=int, default=4)
         parser.add_argument("--idrac-max-workers", type=int, default=60)
         parser.add_argument("--idrac-refresh-days", type=int, default=30)
-        parser.add_argument(
-            "--idrac-mode",
-            choices=["auto", "direct", "ssh"],
-            default=os.getenv("IDRAC_MODE", "auto"),
-        )
-        parser.add_argument("--verbose-idrac", action="store_true", default=True)
+        parser.add_argument("--idrac-mode", choices=["auto", "direct", "ssh"], default=os.getenv("IDRAC_MODE", "auto"))
+
+        # OS info collection
+        parser.add_argument("--os-info", action="store_true", help="Collect used_for/os_type/kernal_version via SSH to hosts.")
+        parser.add_argument("--os-timeout", type=int, default=10)
+        parser.add_argument("--os-max-workers", type=int, default=120)
 
     def handle(self, *args, **opts):
+        # Silence insecure warnings (verify=False)
+        requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+
         jump = opts["jump"]
         user = opts["user"]
         password = opts["password"]
@@ -414,7 +452,10 @@ class Command(BaseCommand):
         idrac_workers = opts["idrac_max_workers"]
         idrac_refresh_days = opts["idrac_refresh_days"]
         idrac_mode = opts["idrac_mode"]
-        verbose_idrac = opts["verbose_idrac"]
+
+        do_osinfo = opts["os_info"]
+        os_timeout = opts["os_timeout"]
+        os_workers = opts["os_max_workers"]
 
         def wrap(cmd: str) -> str:
             return f"bash -lc '{cmd}'" if use_login_shell else cmd
@@ -425,21 +466,22 @@ class Command(BaseCommand):
         clusters = parse_lsclusters(raw_clusters)
         self.stdout.write(self.style.SUCCESS(f"Found {len(clusters)} clusters"))
 
+        # host_id -> (idrac_fqdn, master)
         idrac_work: Dict[int, Tuple[str, str]] = {}
 
-        now = timezone.now()
+        # host_id -> host_fqdn (for OS info)
+        osinfo_work: Dict[int, str] = {}
 
-        # Flag to warn once about missing refresh field
+        now = timezone.now()
         warned_about_missing_field = False
 
         for cluster_name, master_raw in clusters:
             master = normalize_master_host(master_raw, master_domain)
             self.stdout.write(f"\nCluster={cluster_name} master={master} (raw={master_raw})")
 
-            try:
-                raw_hosts = ssh_run(master, user, password, wrap("bhosts"), timeout=timeout)
-            except Exception as e:
-                self.stdout.write(self.style.WARNING(f"  SKIP: cannot SSH to master {master}: {e}"))
+            raw_hosts = ssh_run(master, user, password, wrap("bhosts"), timeout=timeout)
+            if "SSH_ERROR" in raw_hosts:
+                self.stdout.write(self.style.WARNING(f"  SKIP: cannot SSH to master {master}: {raw_hosts}"))
                 continue
 
             host_rows = parse_bhosts(raw_hosts)
@@ -467,9 +509,10 @@ class Command(BaseCommand):
                     host_type = infer_host_type(host_fqdn)
                     status = map_lsf_status_to_inventory(lsf_status)
 
-                    idrac_fqdn = idrac_from_host_fqdn(host_fqdn) if do_idrac else None
+                    idrac_fqdn = idrac_from_host_fqdn(host_fqdn) if do_idrac else ""
 
-                    obj, created = Host.objects.update_or_create(
+                    # NOTE: your Host model has required fields; set safe defaults
+                    obj, _ = Host.objects.update_or_create(
                         cluster=cluster_obj,
                         hostname=host_fqdn,
                         defaults={
@@ -477,16 +520,18 @@ class Command(BaseCommand):
                             "status": status,
                             "enabled": True,
                             "last_seen": now,
-                            "idrac_host": idrac_fqdn,
+                            "idrac_host": idrac_fqdn or "",
+                            "hw_model": "",  # filled by iDRAC
                         },
                     )
 
                     if do_idrac and idrac_fqdn:
-                        # --- SAFE REFRESH LOGIC (handles missing last_hardware_refresh field) ---
                         if hasattr(obj, "last_hardware_refresh"):
                             needs_refresh = (
-                                obj.hw_model is None
-                                or obj.bios_version is None
+                                not obj.hw_model
+                                or not obj.bios_version
+                                or not obj.serialnumber
+                                or not obj.asset_tag
                                 or obj.last_hardware_refresh is None
                                 or (now - obj.last_hardware_refresh).days >= idrac_refresh_days
                             )
@@ -502,6 +547,10 @@ class Command(BaseCommand):
                         if needs_refresh:
                             idrac_work[obj.id] = (idrac_fqdn, master)
 
+                    if do_osinfo:
+                        # Always attempt OS info collection; it will skip if SSH fails
+                        osinfo_work[obj.id] = host_fqdn
+
                 if disable_missing:
                     Host.objects.filter(cluster=cluster_obj).exclude(hostname__in=seen).update(enabled=False)
 
@@ -510,7 +559,7 @@ class Command(BaseCommand):
             return
 
         # ────────────────────────────────────────────────
-        # iDRAC / Redfish enrichment (Dell + Supermicro)
+        # iDRAC / Redfish enrichment
         # ────────────────────────────────────────────────
         if do_idrac:
             if not idrac_user or not idrac_password:
@@ -535,7 +584,7 @@ class Command(BaseCommand):
                             stdout=self.stdout,
                             style=self.style,
                         )
-                        if info.get("model") or info.get("bios"):
+                        if info.get("error") is None:
                             return host_id, idrac_host, info
 
                     if idrac_mode in ("ssh", "auto"):
@@ -552,9 +601,7 @@ class Command(BaseCommand):
                         )
                         return host_id, idrac_host, info
 
-                    err = "no valid fetch mode succeeded"
-                    self.stdout.write(self.style.WARNING(f"SKIPPED iDRAC {idrac_host} → {err}"))
-                    return host_id, idrac_host, {"error": err}
+                    return host_id, idrac_host, {"error": "no valid fetch mode succeeded"}
 
                 updated = 0
                 failures = 0
@@ -564,14 +611,15 @@ class Command(BaseCommand):
                     for f in as_completed(futures):
                         host_id, idrac_host, info = f.result()
 
-                        if not (info.get("model") or info.get("bios")):
+                        if info.get("error"):
                             failures += 1
                             continue
 
-                        # --- SAFE UPDATE (handles missing last_hardware_refresh field) ---
                         update_data = {
-                            "hw_model": info.get("model"),
+                            "hw_model": info.get("model") or "",
                             "bios_version": info.get("bios"),
+                            "serialnumber": info.get("serial"),
+                            "asset_tag": info.get("asset_tag"),
                         }
                         if hasattr(Host, "last_hardware_refresh"):
                             update_data["last_hardware_refresh"] = now
@@ -583,4 +631,57 @@ class Command(BaseCommand):
                     f"iDRAC complete: updated={updated}, failures={failures}, skipped={len(work_items)-updated-failures}"
                 ))
 
-        self.stdout.write(self.style.SUCCESS("\nLSF + Redfish sync complete"))
+        # ────────────────────────────────────────────────
+        # OS info enrichment (used_for / os_type / kernal_version)
+        # ────────────────────────────────────────────────
+        if do_osinfo:
+            if not osinfo_work:
+                self.stdout.write(self.style.WARNING("OS info requested but no hosts were queued."))
+            else:
+                items = list(osinfo_work.items())
+                self.stdout.write(self.style.SUCCESS(
+                    f"Collecting OS info on {len(items)} hosts (workers={os_workers}, timeout={os_timeout}s)"
+                ))
+
+                def fetch_os(item: Tuple[int, str]):
+                    host_id, host_fqdn = item
+
+                    used_for_out = ssh_run(host_fqdn, user, password, "cat /etc/GMIT-HPC 2>/dev/null", timeout=os_timeout)
+                    os_out = ssh_run(host_fqdn, user, password, "grep '^PRETTY_NAME' /etc/os-release 2>/dev/null", timeout=os_timeout)
+                    kern_out = ssh_run(host_fqdn, user, password, "uname -r", timeout=os_timeout)
+
+                    used_for = parse_used_for(used_for_out)
+                    os_type = parse_pretty_name(os_out)
+                    kernal = parse_single_line(kern_out)
+
+                    return host_id, {"used_for": used_for, "os_type": os_type, "kernal_version": kernal}
+
+                updated = 0
+                failures = 0
+
+                with ThreadPoolExecutor(max_workers=os_workers) as ex:
+                    futures = [ex.submit(fetch_os, it) for it in items]
+                    for f in as_completed(futures):
+                        host_id, data = f.result()
+
+                        # Only update fields we successfully got (avoid overwriting with None)
+                        update_data = {}
+                        if data.get("used_for") is not None:
+                            update_data["used_for"] = data["used_for"]
+                        if data.get("os_type") is not None:
+                            update_data["os_type"] = data["os_type"]
+                        if data.get("kernal_version") is not None:
+                            update_data["kernal_version"] = data["kernal_version"]
+
+                        if not update_data:
+                            failures += 1
+                            continue
+
+                        Host.objects.filter(id=host_id).update(**update_data)
+                        updated += 1
+
+                self.stdout.write(self.style.SUCCESS(
+                    f"OS info complete: updated={updated}, failures={failures}, skipped={len(items)-updated-failures}"
+                ))
+
+        self.stdout.write(self.style.SUCCESS("\nLSF + Redfish + OS info sync complete"))

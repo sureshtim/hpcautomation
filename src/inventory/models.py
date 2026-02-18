@@ -5,6 +5,7 @@ class HostType(models.TextChoices):
     COMPUTE = "compute", "compute"
     INFRA = "infra", "infra"
     VIZ = "viz", "viz"
+    CES = "ces", "ces"
 
 
 class HostStatus(models.TextChoices):
@@ -59,6 +60,9 @@ class Host(models.Model):
     shelf = models.CharField(max_length=255, blank=True, null=True)
     serialnumber = models.CharField(max_length=255, blank=True, null=True)
     asset_tag = models.CharField(max_length=255, blank=True, null=True)
+    used_for = models.CharField(max_length=255, blank=True, null=True)
+    os_type = models.CharField(max_length=255, blank=True, null=True)
+    kernal_version = models.CharField(max_length=255, blank=True, null=True)
 
     last_seen = models.DateTimeField(null=True, blank=True)
     last_status_change = models.DateTimeField(null=True, blank=True)
