@@ -1,3 +1,4 @@
+# inventory/management/commands/sync_gpfs_ces_inventory.py
 import os
 import re
 import json
@@ -17,9 +18,9 @@ from inventory.models import HPCCluster, Host, HostStatus
 
 
 # -----------------------------
-# GPFS CES command
+# GPFS command
 # -----------------------------
-CES_LIST_CMD = "mmces address list | awk 'NR>2 {print $2}' | cut -d'-' -f1 | sort -u"
+CES_LIST_CMD = "mmlscluster -Y | awk -F: '/clusterNode/ {print $8}' | tail -n +2 | sed 's/-gpfs.*//' | grep -E 'ces|xphhpc'"
 
 
 # -----------------------------
@@ -114,9 +115,17 @@ def parse_ces_nodes(text: str) -> List[str]:
 # -----------------------------
 # Inventory mappings
 # -----------------------------
-def infer_host_type(_: str) -> str:
-    # Make sure HostType.choices includes "ces"
-    return "ces"
+def infer_host_type(hostname: str) -> str:
+    """
+    Infer host type from hostname:
+      - contains 'ces' → ces            (e.g. dcwipphces*, dcmipphces*)
+      - else  → storage-infra  (e.g. dcwixphhpc*)
+    """
+    name = (hostname or "").lower()
+    if "ces" in name.lower():
+        return "ces"
+    if "xphhpc" in name:
+        return "storage-infra"
 
 
 def map_gpfs_to_inventory_status() -> str:
@@ -437,7 +446,8 @@ class Command(BaseCommand):
             if dry:
                 for n in nodes[:10]:
                     host_fqdn = n if "." in n else (n + host_domain)
-                    self.stdout.write(f"  - {host_fqdn}")
+                    host_type = infer_host_type(host_fqdn)
+                    self.stdout.write(f"  - {host_fqdn}  [{host_type}]")
                 continue
 
             with transaction.atomic():
@@ -448,13 +458,16 @@ class Command(BaseCommand):
                     host_fqdn = normalize_name(node if "." in node else (node + host_domain))
                     seen.add(host_fqdn)
 
+                    host_type = infer_host_type(host_fqdn)
                     idrac_fqdn = idrac_from_host_fqdn(host_fqdn) if do_idrac else ""
+
+                    self.stdout.write(f"  Upserting {host_fqdn}  type={host_type}")
 
                     obj, _ = Host.objects.update_or_create(
                         cluster=cluster_obj,
                         hostname=host_fqdn,
                         defaults={
-                            "host_type": infer_host_type(host_fqdn),
+                            "host_type": host_type,
                             "status": map_gpfs_to_inventory_status(),
                             "enabled": True,
                             "last_seen": now,
@@ -506,7 +519,6 @@ class Command(BaseCommand):
 
                 def fetch_one(item: Tuple[int, str]):
                     host_id, idrac_host = item
-                    # CES inventory doesn't have a convenient "master" like LSF; use direct only
                     info = redfish_get_system_info_direct(
                         idrac_host=idrac_host,
                         user=idrac_user,

@@ -31,19 +31,18 @@ def table_export_csv(request, group, table_id):
 
     qs = table.queryset
 
-    # allow __filters
+    # Apply __filters from query params
     for k, v in request.GET.items():
         if k in ("q",):
             continue
         if "__" in k:
             qs = qs.filter(**{k: v})
 
-    # search
+    # Apply search
     q_text = request.GET.get("q", "").strip()
     qs = apply_search(qs, q_text, getattr(table, "search_fields", []))
 
-    # ---- permissions (optional) ----
-    # If your table defines edit_permission, use the current user.
+    # Resolve edit permission
     can_edit = False
     edit_perm = getattr(table, "edit_permission", None)
     if edit_perm and hasattr(request, "user"):
@@ -52,34 +51,38 @@ def table_export_csv(request, group, table_id):
         except Exception:
             can_edit = False
 
-    # ---- tabulator columns ----
+    # Resolve tabulator columns (same call the view makes)
     tc = getattr(layout, "tabulator_columns", None)
-    if callable(tc):
-        # your ColumnLayout expects: tabulator_columns(can_edit_table)
-        columns = tc(can_edit)
-    else:
-        columns = tc or []
+    columns = tc(can_edit) if callable(tc) else (tc or [])
 
-    # ---- value fields ----
-    vf = getattr(layout, "value_fields", [])
-    fields = list(vf() if callable(vf) else vf)
-    if "id" not in fields:
-        fields.append("id")
+    # Build export columns directly from tabulator_columns so that:
+    #   - order matches the view exactly
+    #   - hidden columns (visible=False) are excluded
+    #   - action-only button columns are excluded
+    #   - titles match the column headers the user sees
+    export_columns = [
+        c for c in columns
+        if isinstance(c, dict)
+        and c.get("field")
+        and c.get("visible", True)
+        and c.get("formatter") != "buttonCross"
+    ]
 
-    # Header row: use column titles where possible
-    title_by_field = {}
-    for c in columns or []:
-        if isinstance(c, dict) and c.get("field"):
-            title_by_field[c["field"]] = c.get("title", c["field"])
+    fields = [c["field"] for c in export_columns]
+    header = [c.get("title") or c["field"] for c in export_columns]
 
-    header = [title_by_field.get(f, f) for f in fields]
+    # Pass ALL column fields directly to .values() — do NOT validate them
+    # against model._meta. Related fields (e.g. "cluster__name") and annotated
+    # fields are perfectly valid in .values() even if they don't appear in
+    # get_fields() by that exact name.
+    values_fields = list(dict.fromkeys(["id"] + fields))  # dedup, id first
 
     pseudo_buffer = Echo()
     writer = csv.writer(pseudo_buffer)
 
     def row_iter():
         yield writer.writerow(header)
-        for row in qs.values(*fields).iterator(chunk_size=2000):
+        for row in qs.values(*values_fields).iterator(chunk_size=2000):
             yield writer.writerow([row.get(f, "") for f in fields])
 
     filename = f"{group}_{table_id}.csv"

@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import time
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional, Dict
 
@@ -14,46 +16,56 @@ from django.utils import timezone
 
 from inventory.models import HPCCluster, Host, HostStatus
 
+# Suppress paramiko's internal "Error reading SSH protocol banner" noise
+logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+
 
 # -----------------------------
-# SSH helper (PASSWORD auth) - ROBUST TIMEOUT FIX
+# SSH helper (PASSWORD auth) - ROBUST TIMEOUT + RETRY FIX
 # -----------------------------
-def ssh_run(host: str, username: str, password: str, cmd: str, timeout: int = 60) -> str:
-    """Run SSH command with explicit channel timeouts to prevent hanging reads."""
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    try:
-        client.connect(
-            hostname=host,
-            username=username,
-            password=password,
-            timeout=timeout,
-            banner_timeout=timeout,
-            auth_timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-
-        stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-
-        stdout.channel.settimeout(timeout)
-        stderr.channel.settimeout(timeout)
-
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        client.close()
-
-        if err.strip():
-            out = out + "\n" + err
-        return out
-
-    except Exception as e:
+def ssh_run(host: str, username: str, password: str, cmd: str, timeout: int = 60, retries: int = 2) -> str:
+    """
+    Run SSH command with explicit channel timeouts and retry/backoff to handle
+    connection flooding (banner read failures when hitting many hosts in parallel).
+    """
+    last_err = ""
+    for attempt in range(retries + 1):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
+            client.connect(
+                hostname=host,
+                username=username,
+                password=password,
+                timeout=timeout,
+                banner_timeout=timeout,
+                auth_timeout=timeout,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+
+            stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+            stdout.channel.settimeout(timeout)
+            stderr.channel.settimeout(timeout)
+
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
             client.close()
-        except Exception:
-            pass
-        return f"SSH_ERROR: {type(e).__name__}: {str(e)}"
+
+            if err.strip():
+                out = out + "\n" + err
+            return out
+
+        except Exception as e:
+            last_err = f"SSH_ERROR: {type(e).__name__}: {str(e)}"
+            try:
+                client.close()
+            except Exception:
+                pass
+            if attempt < retries:
+                time.sleep(1 * (attempt + 1))  # 1s then 2s backoff before retry
+
+    return last_err
 
 
 # -----------------------------
@@ -68,7 +80,22 @@ def parse_lsclusters(text: str) -> List[Tuple[str, str]]:
         parts = re.split(r"\s+", line)
         if len(parts) < 3:
             continue
+        # Skip lines where the cluster name looks like an SSH error or garbage
+        if parts[0].startswith("SSH_ERROR") or parts[0] == "Bad":
+            continue
         items.append((parts[0], parts[2]))
+
+    # Inject NAHPC_SUBMIT_TEST if not already present in parsed output
+    parsed_names = {name for name, _ in items}
+    if "NAHPC_SUBMIT_TEST" not in parsed_names:
+        items.append(("NAHPC_SUBMIT_TEST", "dcwixphhpc141"))
+
+    # Always ensure azhpc_use1 → hpcsubmitp1 pair exists regardless of what
+    # lsclusters returned (it may be absent or paired with a different master)
+    if ("azhpc_use1", "hpcsubmitp1") not in items:
+        items = [(name, master) for name, master in items if name != "azhpc_use1"]
+        items.append(("azhpc_use1", "hpcsubmitp1"))
+
     return items
 
 
@@ -370,7 +397,6 @@ def redfish_get_system_info_via_ssh(
 # OS discovery over SSH to host
 # -----------------------------
 def parse_pretty_name(text: str) -> Optional[str]:
-    # expected: PRETTY_NAME="Rocky Linux 8.9 (Green Obsidian)"
     m = re.search(r'^PRETTY_NAME\s*=\s*"(.*)"\s*$', (text or "").strip(), flags=re.M)
     if m:
         return m.group(1).strip() or None
@@ -389,7 +415,6 @@ def parse_single_line(text: str) -> Optional[str]:
 
 
 def parse_used_for(text: str) -> Optional[str]:
-    # /etc/GMIT-HPC may have multiple lines; store first non-empty line
     if not text or text.startswith("SSH_ERROR"):
         return None
     for line in text.splitlines():
@@ -428,11 +453,10 @@ class Command(BaseCommand):
 
         # OS info collection
         parser.add_argument("--os-info", action="store_true", help="Collect used_for/os_type/kernal_version via SSH to hosts.")
-        parser.add_argument("--os-timeout", type=int, default=10)
-        parser.add_argument("--os-max-workers", type=int, default=120)
+        parser.add_argument("--os-timeout", type=int, default=15)       # raised from 10 → 15
+        parser.add_argument("--os-max-workers", type=int, default=40)   # lowered from 120 → 40
 
     def handle(self, *args, **opts):
-        # Silence insecure warnings (verify=False)
         requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
         jump = opts["jump"]
@@ -508,10 +532,8 @@ class Command(BaseCommand):
 
                     host_type = infer_host_type(host_fqdn)
                     status = map_lsf_status_to_inventory(lsf_status)
-
                     idrac_fqdn = idrac_from_host_fqdn(host_fqdn) if do_idrac else ""
 
-                    # NOTE: your Host model has required fields; set safe defaults
                     obj, _ = Host.objects.update_or_create(
                         cluster=cluster_obj,
                         hostname=host_fqdn,
@@ -521,7 +543,7 @@ class Command(BaseCommand):
                             "enabled": True,
                             "last_seen": now,
                             "idrac_host": idrac_fqdn or "",
-                            "hw_model": "",  # filled by iDRAC
+                            "hw_model": "",
                         },
                     )
 
@@ -548,7 +570,6 @@ class Command(BaseCommand):
                             idrac_work[obj.id] = (idrac_fqdn, master)
 
                     if do_osinfo:
-                        # Always attempt OS info collection; it will skip if SSH fails
                         osinfo_work[obj.id] = host_fqdn
 
                 if disable_missing:
@@ -664,7 +685,6 @@ class Command(BaseCommand):
                     for f in as_completed(futures):
                         host_id, data = f.result()
 
-                        # Only update fields we successfully got (avoid overwriting with None)
                         update_data = {}
                         if data.get("used_for") is not None:
                             update_data["used_for"] = data["used_for"]

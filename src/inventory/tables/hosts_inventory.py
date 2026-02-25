@@ -23,7 +23,7 @@ class HostTableView(HPCTables):
     tabulator_settings = {
         "progressiveLoad": "scroll",
         "paginationMode": "remote",
-        "paginationSize": 300,
+        "paginationSize": 500,
         "progressiveLoadScrollMargin": 400,
         "filterMode": "remote",
     }
