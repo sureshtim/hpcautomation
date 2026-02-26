@@ -1,3 +1,4 @@
+hpc-appl-new
 gmhpc3
 gmhpc4
 gmhpc7
